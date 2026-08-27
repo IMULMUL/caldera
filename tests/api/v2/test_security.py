@@ -1,4 +1,5 @@
 import pytest
+import os
 from aiohttp import web
 
 from app.api.v2 import security
@@ -8,26 +9,33 @@ from app.utility.base_world import BaseWorld
 
 @pytest.fixture
 def base_world():
+    cookie_path = os.path.join('data', 'cookie_storage')
     BaseWorld.clear_config()
+    if os.path.exists(cookie_path):
+        os.remove(cookie_path)
 
     BaseWorld.apply_config(
         name='main',
         config={
             CONFIG_API_KEY_RED: 'abc123',
-
+            'crypt_salt': 'REPLACE_WITH_RANDOM_VALUE',
+            'encryption_key': 'ADMIN123',
             'users': {
                 'red': {'reduser': 'redpass'},
                 'blue': {'blueuser': 'bluepass'}
             }
-        }
+        },
+        apply_hash=True
     )
 
     yield BaseWorld
     BaseWorld.clear_config()
+    if os.path.exists(cookie_path):
+        os.remove(cookie_path)
 
 
 @pytest.fixture
-def simple_webapp(loop, base_world):
+def simple_webapp(event_loop, base_world):
     async def index(request):
         return web.Response(status=200, text='hello!')
 
@@ -50,13 +58,13 @@ def simple_webapp(loop, base_world):
 
     auth_svc = AuthService()
 
-    loop.run_until_complete(
+    event_loop.run_until_complete(
         auth_svc.apply(
             app=app,
             users=base_world.get_config('users')
         )
     )
-    loop.run_until_complete(auth_svc.set_login_handlers(auth_svc.get_services()))
+    event_loop.run_until_complete(auth_svc.set_login_handlers(auth_svc.get_services()))
 
     # The authentication_required middleware needs to run after the session middleware.
     # AuthService.apply(...) adds session middleware to the app, so we can append the

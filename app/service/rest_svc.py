@@ -1,11 +1,13 @@
 import asyncio
 import copy
 import glob
+import itertools
 import os
 import pathlib
 import uuid
 from datetime import time
 import re
+import logging
 
 import yaml
 from aiohttp import web
@@ -16,6 +18,7 @@ from app.objects.c_operation import Operation
 from app.objects.c_ability import Ability
 from app.objects.c_source import Source
 from app.objects.c_schedule import Schedule
+from app.objects.secondclass.c_executor import Executor
 from app.objects.secondclass.c_link import Link
 from app.objects.secondclass.c_fact import Fact
 from app.service.interfaces.i_rest_svc import RestServiceInterface
@@ -25,8 +28,13 @@ from app.utility.base_service import BaseService
 class RestService(RestServiceInterface, BaseService):
 
     def __init__(self):
+        logging.getLogger('asyncio').setLevel(logging.WARNING)
         self.log = self.add_service('rest_svc', self)
-        self.loop = asyncio.get_event_loop()
+        try:
+            self.loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
     async def persist_adversary(self, access, data):
         """Persist adversaries. Accepts single adversary or bulk set of adversaries.
@@ -62,7 +70,7 @@ class RestService(RestServiceInterface, BaseService):
             data = [data]
         r = []
         for ab in data:
-            r.extend(await self._persist_ability(access, ab))
+            r.append(await self._persist_ability(access, ab))
         return r
 
     async def persist_source(self, access, data):
@@ -124,8 +132,8 @@ class RestService(RestServiceInterface, BaseService):
                 content = self.get_service('file_svc').read_result_file('%s' % link_id)
                 return dict(link=link.display, output=content)
             except FileNotFoundError:
-                return ''
-        return ''
+                return dict(link=link.display, output='')
+        return dict()
 
     async def display_operation_report(self, data):
         op_id = data.pop('op_id')
@@ -169,29 +177,27 @@ class RestService(RestServiceInterface, BaseService):
 
     async def create_schedule(self, access, data):
         operation = await self._build_operation_object(access, data['operation'])
-        schedules = await self.get_service('data_svc').locate('schedules', match=dict(name=operation.name))
+        schedule_id = str(uuid.uuid4())
+        schedules = await self.get_service('data_svc').locate('schedules', match=dict(id=schedule_id))
         if schedules:
-            self.log.debug('A scheduled operation with the name "%s" already exists, skipping' % operation.name)
+            self.log.debug('A Schedule with the id "%s" already exists, skipping' % schedule_id)
         else:
             scheduled = await self.get_service('data_svc').store(
-                Schedule(name=operation.name,
-                         schedule=time(data['schedule']['hour'], data['schedule']['minute'], 0),
-                         task=operation)
+                Schedule(schedule=time(data['schedule']['hour'], data['schedule']['minute'], 0),
+                         task=operation, id=schedule_id)
             )
             self.log.debug('Scheduled new operation (%s) for %s' % (operation.name, scheduled.schedule))
 
     async def list_payloads(self):
+        file_svc = self.get_service('file_svc')
         payload_dirs = [pathlib.Path.cwd() / 'data' / 'payloads']
         payload_dirs.extend(pathlib.Path.cwd() / 'plugins' / plugin.name / 'payloads'
                             for plugin in await self.get_service('data_svc').locate('plugins') if plugin.enabled)
-        payloads = set()
-        for p_dir in payload_dirs:
-            for p in p_dir.glob('*'):
-                if p.is_file() and not p.name.startswith('.'):
-                    if p.name.endswith('.xored'):
-                        payloads.add(p.name.replace('.xored', ''))
-                    else:
-                        payloads.add(p.name)
+        payloads = {
+            file_svc.remove_xored_extension(p.name)
+            for p in itertools.chain.from_iterable(p_dir.glob('[!.]*') for p_dir in payload_dirs)
+            if p.is_file()
+        }
         return payloads
 
     async def find_abilities(self, paw):
@@ -204,9 +210,9 @@ class RestService(RestServiceInterface, BaseService):
         if operation.finish:
             return []
         agents = await self.get_service('data_svc').locate('agents', match=dict(paw=paw)) if paw else operation.agents
-        potential_abilities = await self._build_potential_abilities(operation)
-        operation.potential_links = await self._build_potential_links(operation, agents, potential_abilities)
-        return dict(links=[l.display for l in operation.potential_links])
+        potential_abilities = await self.build_potential_abilities(operation)
+        operation.potential_links = await self.build_potential_links(operation, agents, potential_abilities)
+        return dict(links=[s_link.display for s_link in operation.potential_links])
 
     async def apply_potential_link(self, link):
         operation = await self.get_service('app_svc').find_op_with_link(link.id)
@@ -232,12 +238,13 @@ class RestService(RestServiceInterface, BaseService):
 
         encoded_command = self.encode_string(data['command'])
         ability_id = str(uuid.uuid4())
+
+        executor = Executor(name=data['executor'], platform=agent.platform, command=data['command'])
         ability = Ability(ability_id=ability_id, tactic='auto-generated', technique_id='auto-generated',
-                          technique='auto-generated', name='Manual Command', description='Manual command ability',
-                          cleanup='', test=encoded_command, executor=data['executor'], platform=agent.platform,
-                          payloads=[], parsers=[], requirements=[], privilege=None, variations=[])
+                          technique_name='auto-generated', name='Manual Command', description='Manual command ability',
+                          executors=[executor])
         link = Link.load(dict(command=encoded_command, paw=agent.paw, cleanup=0, ability=ability, score=0, jitter=2,
-                              status=operation.link_status()))
+                              executor=executor, status=operation.link_status()))
         link.apply_id(agent.host)
         operation.add_link(link)
 
@@ -265,16 +272,6 @@ class RestService(RestServiceInterface, BaseService):
         if group:
             return await self.get_service('data_svc').locate('agents', match=dict(group=group))
         return await self.get_service('data_svc').locate('agents')
-
-    async def update_config(self, data):
-        if data.get('prop') == 'plugin':
-            enabled_plugins = self.get_config('plugins')
-            new_plugin = data.get('value')
-            if new_plugin not in enabled_plugins:
-                enabled_plugins.append(new_plugin)
-        elif data.get('prop') != 'requirements':  # Prevent users from editing requirements via API.
-            self.set_config('main', data.get('prop'), data.get('value'))
-        return self.get_config()
 
     async def update_operation(self, op_id, state=None, autonomous=None, obfuscator=None):
         async def validate(op):
@@ -304,11 +301,13 @@ class RestService(RestServiceInterface, BaseService):
     async def get_agent_configuration(self, data):
         abilities = await self.get_service('data_svc').locate('abilities', data)
 
-        raw_abilities = [{'platform': ability.platform, 'executor': ability.executor,
-                          'description': ability.description, 'command': ability.raw_command,
-                          'variations': [{'description': v.description, 'command': v.raw_command}
-                                         for v in ability.variations]}
-                         for ability in abilities]
+        raw_abilities = []
+        for ability in abilities:
+            for executor in ability.executors:
+                variations = [{'description': v.description, 'command': v.raw_command} for v in executor.variations]
+                raw_abilities.append({'platform': executor.platform, 'executor': executor.name,
+                                      'description': ability.description, 'command': executor.command,
+                                      'variations': variations})
 
         app_config = {k: v for k, v in self.get_config().items() if k.startswith('app.')}
         app_config.update({'agents.%s' % k: v for k, v in self.get_config(name='agents').items()})
@@ -324,7 +323,19 @@ class RestService(RestServiceInterface, BaseService):
                     files.pop(key, None)
         return files
 
-    """ PRIVATE """
+    async def build_potential_abilities(self, operation):
+        potential_abilities = []
+        for a in await self.get_service('data_svc').locate('abilities', match=dict(access=operation.access)):
+            if not operation.adversary.has_ability(a.ability_id):
+                potential_abilities.append(a)
+        return potential_abilities
+
+    async def build_potential_links(self, operation, agents, abilities):
+        potential_links = []
+        for a in agents:
+            for pl in await self.get_service('planning_svc').generate_and_trim_links(a, operation, abilities):
+                potential_links.append(pl)
+        return await self.get_service('planning_svc').sort_links(potential_links)
 
     async def _build_operation_object(self, access, data):
         name = data.pop('name')
@@ -340,7 +351,6 @@ class RestService(RestServiceInterface, BaseService):
                          state=data.pop('state', 'running'), autonomous=int(data.pop('autonomous', 1)), access=allowed,
                          obfuscator=data.pop('obfuscator', 'plain-text'),
                          auto_close=bool(int(data.pop('auto_close', 0))), visibility=int(data.pop('visibility', '50')),
-                         timeout=int(data.pop('timeout', 30)),
                          use_learning_parsers=bool(int(data.pop('use_learning_parsers', 0))))
 
     def _get_allowed_from_access(self, access):
@@ -373,25 +383,12 @@ class RestService(RestServiceInterface, BaseService):
         if new_stopping_conditions:
             return [{s.get('trait'): s.get('value')} for s in new_stopping_conditions]
 
-    async def _build_potential_abilities(self, operation):
-        potential_abilities = []
-        for a in await self.get_service('data_svc').locate('abilities', match=dict(access=operation.access)):
-            if not operation.adversary.has_ability(a.ability_id):
-                potential_abilities.append(a)
-        return potential_abilities
-
-    async def _build_potential_links(self, operation, agents, abilities):
-        potential_links = []
-        for a in agents:
-            for pl in await self.get_service('planning_svc').generate_and_trim_links(a, operation, abilities):
-                potential_links.append(pl)
-        return await self.get_service('planning_svc').sort_links(potential_links)
-
     async def _construct_adversary_for_op(self, adversary_id):
         adv = await self.get_service('data_svc').locate('adversaries', match=dict(adversary_id=adversary_id))
         if adv:
             return copy.deepcopy(adv[0])
-        return Adversary.load(dict(adversary_id='ad-hoc', name='ad-hoc', description='an empty adversary profile', atomic_ordering=[]))
+        return Adversary.load(dict(adversary_id='ad-hoc', name='ad-hoc', description='an empty adversary profile',
+                                   atomic_ordering=[]))
 
     async def _update_global_props(self, sleep_min, sleep_max, watchdog, untrusted, implant_name,
                                    bootstrap_abilities, deadman_abilities):
@@ -433,7 +430,8 @@ class RestService(RestServiceInterface, BaseService):
         :type prop_name: str
         """
         abilities = []
-        for ability_id in [ability_id.strip() for ability_id in abilities_str.split(',') if ability_id.strip()]:
+        ability_id_list = [ability_id.strip() for ability_id in abilities_str.split(',') if ability_id.strip()]
+        for ability_id in ability_id_list:
             if await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id.strip())):
                 abilities.append(ability_id)
             else:
@@ -517,13 +515,12 @@ class RestService(RestServiceInterface, BaseService):
             - update current ability with new ability
             - add parsers back in to current ability
             - save current ability to disk, then re-load ability from file
-            - check/set executor timeouts on loaded abilities
         :param access: Current access list
         :type access: dict
         :param ab: Ability to add or
         :type ab: dict
         :return: Created / updated ability
-        :rtype: List(Ability)
+        :rtype: Ability
         """
         # Set ability ID if undefined
         if not ab.get('id'):
@@ -545,11 +542,8 @@ class RestService(RestServiceInterface, BaseService):
 
         # Validate platforms, ability will not be loaded if empty
         if not ab.get('platforms'):
-            self.log.debug('At least one platform/executor is required to save ability.')
+            self.log.debug('At least one executor is required to save ability.')
             return []
-
-        # Create a new ability to be used for updating/creating
-        new_ability, new_ability_exec_timeouts = await self._prep_new_ability(ab)
 
         # Update or create ability
         _, file_path = await self.get_service('file_svc').find_file_path('{}.yml'.format(ab['id']), location='data')
@@ -557,18 +551,18 @@ class RestService(RestServiceInterface, BaseService):
             # Ability exists, update
             current_ability = dict(self.strip_yml(file_path)[0][0])
             current_ability, current_parsers = await self._strip_parsers_from_ability(current_ability)
-            current_ability.update(new_ability)
+            current_ability.update(ab)
             final = await self._add_parsers_to_ability(current_ability, current_parsers)
             # Get access
             found_abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=ab['id']))
             allowed = found_abilities[0].access if found_abilities else self._get_allowed_from_access(access)
         else:
             # Create new ability, create file / directory
-            tactic_dir = os.path.join('data', 'abilities', new_ability.get('tactic'))
+            tactic_dir = os.path.join('data', 'abilities', ab.get('tactic'))
             if not os.path.exists(tactic_dir):
                 os.makedirs(tactic_dir)
-            file_path = os.path.join(tactic_dir, '%s.yml' % new_ability['id'])
-            final = new_ability
+            file_path = os.path.join(tactic_dir, '%s.yml' % ab['id'])
+            final = ab
             # Get access
             allowed = self._get_allowed_from_access(access)
 
@@ -576,9 +570,12 @@ class RestService(RestServiceInterface, BaseService):
                                                      '', encrypt=False)
         await self.get_service('data_svc').remove('abilities', dict(ability_id=final['id']))
         await self.get_service('data_svc').load_ability_file(file_path, allowed)
-        await self._restore_exec_timeouts(final['id'], new_ability_exec_timeouts)
-        return [a.display for a in
-                await self.get_service('data_svc').locate('abilities', dict(ability_id=final['id']))]
+
+        loaded_abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=final['id']))
+        if not loaded_abilities:
+            self.log.error('An error occurred when attempting to load the newly-created ability')
+            return {}
+        return loaded_abilities[0].display
 
     async def _persist_source(self, access, source):
         return await self._persist_item(access, 'sources', Source, source)
@@ -607,42 +604,6 @@ class RestService(RestServiceInterface, BaseService):
                                                      '', encrypt=False)
         await self.get_service('data_svc').load_yaml_file(object_class, file_path, allowed)
 
-    async def _prep_new_ability(self, ab):
-        """Take an ability dict, supplied by frontend, extract executor timeouts,
-        and combine executor sub-dicts that are equivalent under a single CSV
-        formed key under the parent platform.
-
-        Return modified ability dict, and a seperate dict of the executor timeouts.
-        """
-        ability = copy.deepcopy(ab)
-        # remove and store executor timeouts
-        exec_timeouts = {}
-        for platform, executors in ability['platforms'].items():
-            exec_timeouts[platform] = {}
-            for executor, d in executors.items():
-                exec_timeouts[platform][executor] = d.get('timeout', 60)
-                if 'timeout' in ability['platforms'][platform][executor]:
-                    del ability['platforms'][platform][executor]['timeout']
-        # Combine executors under common CSV keys if they are the same
-        platforms = {}
-        for platform, executors in ability['platforms'].items():
-            platforms[platform] = {}
-            for executor, d in executors.items():
-                match = False
-                for executor_1, d_1 in platforms[platform].items():
-                    if d == d_1:
-                        match = executor_1
-                        break
-                if match:
-                    combined_key = ','.join([match, executor])
-                    platforms[platform][combined_key] = d
-                    # and remove previous single key in set
-                    del platforms[platform][match]
-                else:
-                    platforms[platform][executor] = d
-        ability['platforms'] = platforms
-        return ability, exec_timeouts
-
     async def _strip_parsers_from_ability(self, ability):
         """Remove the parsers sub-dict from the executors of an ability
         (where the ability is not an ability object but just the loaded
@@ -651,7 +612,7 @@ class RestService(RestServiceInterface, BaseService):
         Return ability (minus parsers) and parsers as seperate dict
         """
         parsers = {}
-        for platform, executors in ability['platforms'].items():
+        for platform, executors in ability.get('platforms', {}).items():
             parsers[platform] = {}
             for executor, d in executors.items():
                 if d.get('parsers', False):
@@ -664,20 +625,13 @@ class RestService(RestServiceInterface, BaseService):
         not an ability object but just the loaded dict from yaml
         ability file)
         """
-        for platform, executors in ability['platforms'].items():
+        for platform, executors in ability.get('platforms', {}).items():
             if parsers.get(platform, False):
                 for executor, _ in executors.items():
                     if parsers[platform].get(executor, False):
                         ability['platforms'][platform][executor]['parsers'] = parsers[platform][executor]
         return ability
 
-    async def _restore_exec_timeouts(self, ability_id, exec_timeouts):
-        """For the supplied ability, set corresponding executor timeouts."""
-        abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id))
-        for ab in abilities:
-            ab.timeout = exec_timeouts[ab.platform][ab.executor]
-            await self.get_service('data_svc').store(ab)
-
     async def _get_operation_exfil_folders(self, operation_id):
         op = (await self.get_service('data_svc').locate('operations', match=dict(id=operation_id)))[0]
-        return ['%s-%s' % (a.host, a.paw) for a in op.agents]
+        return [a.paw for a in op.agents]

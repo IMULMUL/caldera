@@ -1,59 +1,74 @@
 import re
 from base64 import b64decode
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import marshmallow as ma
 
 from app.objects.interfaces.i_object import FirstClassObjectInterface
 from app.objects.secondclass.c_link import Link, LinkSchema
+from app.objects.secondclass.c_fact import OriginType
 from app.utility.base_object import BaseObject
 from app.utility.base_planning_svc import BasePlanningService
+from app.utility.base_service import BaseService
 
 
 class AgentFieldsSchema(ma.Schema):
 
-    paw = ma.fields.String()
+    paw = ma.fields.String(allow_none=True)
+    sleep_min = ma.fields.Integer()
+    sleep_max = ma.fields.Integer()
+    watchdog = ma.fields.Integer()
     group = ma.fields.String()
     architecture = ma.fields.String()
     platform = ma.fields.String()
     server = ma.fields.String()
-    upstream_dest = ma.fields.String()
+    upstream_dest = ma.fields.String(allow_none=True)
     username = ma.fields.String()
     location = ma.fields.String()
     pid = ma.fields.Integer()
     ppid = ma.fields.Integer()
     trusted = ma.fields.Boolean()
-    last_seen = ma.fields.DateTime(format='%Y-%m-%d %H:%M:%S')
-    sleep_min = ma.fields.Integer()
-    sleep_max = ma.fields.Integer()
     executors = ma.fields.List(ma.fields.String())
     privilege = ma.fields.String()
-    display_name = ma.fields.String()
     exe_name = ma.fields.String()
     host = ma.fields.String()
-    watchdog = ma.fields.Integer()
     contact = ma.fields.String()
+    proxy_receivers = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.List(ma.fields.String()),
+                                     allow_none=True)
+    proxy_chain = ma.fields.List(ma.fields.List(ma.fields.String()), allow_none=True)
+    origin_link_id = ma.fields.String()
+    deadman_enabled = ma.fields.Boolean(allow_none=True)
+    available_contacts = ma.fields.List(ma.fields.String(), allow_none=True)
+    host_ip_addrs = ma.fields.List(ma.fields.String(), allow_none=True)
+
+    display_name = ma.fields.String(dump_only=True)
+    created = ma.fields.DateTime(format=BaseObject.TIME_FORMAT, dump_only=True)
+    last_seen = ma.fields.DateTime(format=BaseObject.TIME_FORMAT, dump_only=True)
+    links = ma.fields.List(ma.fields.Nested(LinkSchema), dump_only=True)
     pending_contact = ma.fields.String()
-    links = ma.fields.List(ma.fields.Nested(LinkSchema()))
-    proxy_receivers = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.List(ma.fields.String()))
-    proxy_chain = ma.fields.List(ma.fields.List(ma.fields.String()))
-    origin_link_id = ma.fields.Integer()
-    deadman_enabled = ma.fields.Boolean()
-    available_contacts = ma.fields.List(ma.fields.String())
-    created = ma.fields.DateTime(format='%Y-%m-%d %H:%M:%S')
-    host_ip_addrs = ma.fields.List(ma.fields.String())
+
+    status = ma.fields.String(dump_only=True)
 
     @ma.pre_load
     def remove_nulls(self, in_data, **_):
         return {k: v for k, v in in_data.items() if v is not None}
 
+    @ma.pre_load
+    def remove_properties(self, data, **_):
+        data.pop('display_name', None)
+        data.pop('created', None)
+        data.pop('last_seen', None)
+        data.pop('links', None)
+        data.pop('status', None)
+        return data
+
 
 class AgentSchema(AgentFieldsSchema):
 
     @ma.post_load
-    def build_agent(self, data, **_):
-        return Agent(**data)
+    def build_agent(self, data, **kwargs):
+        return None if kwargs.get('partial') is True else Agent(**data)
 
 
 class Agent(FirstClassObjectInterface, BaseObject):
@@ -73,11 +88,35 @@ class Agent(FirstClassObjectInterface, BaseObject):
     def display_name(self):
         return '{}${}'.format(self.host, self.username)
 
-    def __init__(self, sleep_min, sleep_max, watchdog, platform='unknown', server='unknown', host='unknown',
+    @property
+    def status(self):
+        now = datetime.now(timezone.utc)
+        untrusted_buffer = int(self.get_config(name='agents', prop='untrusted_timer'))
+        time_diff = (now - self.last_seen).total_seconds()
+        expired = time_diff > int(self.sleep_max) + untrusted_buffer
+        if self._marked_for_stop:
+            # If agent hasn't received the stop instruction yet in a beacon response, it's still pending stop
+            # Otherwise, if agent has received the stop instruction or takes too long to beacon back, mark as dead
+            return 'dead' if self._stop_delivered or expired else 'pending kill'
+        else:
+            # If agent hasn't beaconed in since max beacon time + untrusted timer, mark as dead
+            return 'dead' if expired else 'alive'
+
+    @classmethod
+    def is_global_variable(cls, variable):
+        if variable.startswith('payload:'):
+            return True
+        if variable == 'payload':
+            return False
+        if variable in cls.RESERVED:
+            return True
+        return False
+
+    def __init__(self, sleep_min=30, sleep_max=60, watchdog=0, platform='unknown', server='unknown', host='unknown',
                  username='unknown', architecture='unknown', group='red', location='unknown', pid=0, ppid=0,
                  trusted=True, executors=(), privilege='User', exe_name='unknown', contact='unknown', paw=None,
-                 proxy_receivers=None, proxy_chain=None, origin_link_id=0, deadman_enabled=False,
-                 available_contacts=None, host_ip_addrs=None, upstream_dest=None):
+                 proxy_receivers=None, proxy_chain=None, origin_link_id='', deadman_enabled=False,
+                 available_contacts=None, host_ip_addrs=None, upstream_dest=None, pending_contact=None):
         super().__init__()
         self.paw = paw if paw else self.generate_name(size=6)
         self.host = host
@@ -91,7 +130,7 @@ class Agent(FirstClassObjectInterface, BaseObject):
         self.pid = pid
         self.ppid = ppid
         self.trusted = trusted
-        self.created = datetime.now()
+        self.created = datetime.now(timezone.utc)
         self.last_seen = self.created
         self.last_trusted_seen = self.created
         self.executors = executors
@@ -108,40 +147,68 @@ class Agent(FirstClassObjectInterface, BaseObject):
         self.origin_link_id = origin_link_id
         self.deadman_enabled = deadman_enabled
         self.available_contacts = available_contacts if available_contacts else [self.contact]
-        self.pending_contact = contact
+        self.pending_contact = pending_contact if pending_contact else contact
         self.host_ip_addrs = host_ip_addrs if host_ip_addrs else []
         if upstream_dest:
             upstream_url = urlparse(upstream_dest)
             self.upstream_dest = '%s://%s:%s' % (upstream_url.scheme, upstream_url.hostname, upstream_url.port)
         else:
             self.upstream_dest = self.server
+        self._executor_change_to_assign = None
+        self.log = self.create_logger('agent')
+        self._marked_for_stop = False
+        self._stop_delivered = False
 
     def store(self, ram):
         existing = self.retrieve(ram['agents'], self.unique)
         if not existing:
             ram['agents'].append(self)
             return self.retrieve(ram['agents'], self.unique)
+        existing.update('group', self.group)
+        existing.update('trusted', self.trusted)
+        existing.update('sleep_min', self.sleep_min)
+        existing.update('sleep_max', self.sleep_max)
+        existing.update('watchdog', self.watchdog)
+        existing.update('pending_contact', self.pending_contact)
         return existing
 
     async def calculate_sleep(self):
         return self.jitter('%d/%d' % (self.sleep_min, self.sleep_max))
 
-    async def capabilities(self, ability_set):
-        abilities = []
-        if self.executors:
-            preferred = self._get_preferred_executor()
-            executors = self.executors
-            for ai in set([pa.ability_id for pa in ability_set]):
-                total_ability = [ab for ab in ability_set if (ab.ability_id == ai)
-                                 and (ab.platform == self.platform) and (ab.executor in executors)]
-                if len(total_ability) > 0:
-                    val = next((ta for ta in total_ability if ta.executor == preferred), total_ability[0])
-                    if self.privileged_to_run(val):
-                        abilities.append(val)
-        return abilities
+    async def capabilities(self, abilities):
+        """Get abilities that the agent is capable of running
+        :param abilities: List of abilities to check agent capability
+        :type abilities: List[Ability]
+        :return: List of abilities the agents is capable of running
+        :rtype: List[Ability]
+        """
+        capabilities = []
+        for ability in abilities:
+            if self.privileged_to_run(ability) and ability.find_executors(self.executors, self.platform):
+                capabilities.append(ability)
+        return capabilities
+
+    async def get_preferred_executor(self, ability):
+        """Get preferred executor for ability
+        Will return None if the agent is not capable of running any
+        executors in the given ability.
+        :param ability: Ability to get preferred executor for
+        :type ability: Ability
+        :return: Preferred executor or None
+        :rtype: Union[Executor, None]
+        """
+        potential_executors = ability.find_executors(self.executors, self.platform)
+        if not potential_executors:
+            return None
+
+        preferred_executor_name = self._get_preferred_executor_name()
+        for executor in potential_executors:
+            if executor.name == preferred_executor_name:
+                return executor
+        return potential_executors[0]
 
     async def heartbeat_modification(self, **kwargs):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         self.last_seen = now
         if self.trusted:
             self.last_trusted_seen = now
@@ -155,13 +222,19 @@ class Agent(FirstClassObjectInterface, BaseObject):
         self.update('username', kwargs.get('username'))
         self.update('architecture', kwargs.get('architecture'))
         self.update('platform', kwargs.get('platform'))
-        self.update('executors', kwargs.get('executors'))
         self.update('proxy_receivers', kwargs.get('proxy_receivers'))
         self.update('proxy_chain', kwargs.get('proxy_chain'))
         self.update('deadman_enabled', kwargs.get('deadman_enabled'))
         self.update('contact', kwargs.get('contact'))
         self.update('host_ip_addrs', kwargs.get('host_ip_addrs'))
         self.update('upstream_dest', kwargs.get('upstream_dest'))
+        if not self._executor_change_to_assign:
+            # Don't update executors if we're waiting to assign an executor change to the agent.
+            self.update('executors', kwargs.get('executors'))
+
+        # Check if agent has been marked to stop
+        if self._marked_for_stop and not self._stop_delivered:
+            self._stop_delivered = True
 
     async def gui_modification(self, **kwargs):
         loaded = AgentFieldsSchema(only=('group', 'trusted', 'sleep_min', 'sleep_max', 'watchdog', 'pending_contact')).load(kwargs)
@@ -170,8 +243,11 @@ class Agent(FirstClassObjectInterface, BaseObject):
 
     async def kill(self):
         self.update('watchdog', 1)
-        self.update('sleep_min', 60 * 2)
-        self.update('sleep_max', 60 * 2)
+        self.update('sleep_min', 3)
+        self.update('sleep_max', 3)
+
+        self._marked_for_stop = True
+        self._stop_delivered = False
 
     def replace(self, encoded_cmd, file_svc):
         decoded_cmd = b64decode(encoded_cmd).decode('utf-8', errors='ignore').replace('\n', '')
@@ -206,20 +282,80 @@ class Agent(FirstClassObjectInterface, BaseObject):
         await self.task(abilities, obfuscator='plain-text', deadman=True)
 
     async def task(self, abilities, obfuscator, facts=(), deadman=False):
+        if not self.executors:
+            return []
+
         bps = BasePlanningService()
-        potential_links = [Link.load(dict(command=i.test, paw=self.paw, ability=i, deadman=deadman)) for i in await self.capabilities(abilities)]
+        preferred_executor_name = self._get_preferred_executor_name()
+
         links = []
-        for valid in await bps.remove_links_missing_facts(
-                await bps.add_test_variants(links=potential_links, agent=self, facts=facts)):
-            links.append(valid)
+        for ability in await self.capabilities(abilities):
+            executors = ability.find_executors(self.executors, self.platform)
+            executors = sorted(executors, key=lambda ex: ex.name == preferred_executor_name, reverse=True)
+
+            for executor in executors:
+                ex_links = [Link.load(dict(command=self.encode_string(executor.test), paw=self.paw, ability=ability,
+                                           executor=executor, deadman=deadman))]
+                valid_links = await bps.add_test_variants(links=ex_links, agent=self, facts=facts, trim_unset_variables=True)
+                if valid_links:
+                    links.extend(valid_links)
+                    break
+
         links = await bps.obfuscate_commands(self, obfuscator, links)
+        knowledge_svc_handle = BaseService.get_service('knowledge_svc')
+        for fact in facts:
+            fact.source = self.paw
+            fact.origin_type = OriginType.SEEDED
+            await knowledge_svc_handle.add_fact(fact)
         self.links.extend(links)
         return links
 
-    def all_facts(self):
-        return [f for lnk in self.links for f in lnk.facts if f.score > 0]
+    async def all_facts(self):
+        knowledge_svc_handle = BaseService.get_service('knowledge_svc')
+        return await knowledge_svc_handle.get_facts(dict(source=self.paw))
 
-    """ PRIVATE """
+    @property
+    def executor_change_to_assign(self):
+        return self._executor_change_to_assign
+
+    def set_pending_executor_removal(self, executor_name):
+        """Mark specified executor to remove.
+        :param executor_name: name of executor for agent to remove
+        :type executor_name: str
+        """
+        if executor_name and isinstance(executor_name, str):
+            if executor_name in self.executors:
+                # Remove the executor server-side so planners can generate appropriate links immediately.
+                self.executors.remove(executor_name)
+                self._executor_change_to_assign = dict(action='remove', executor=executor_name)
+        else:
+            self.log.error('Paw %s: Invalid executor name. Please provide non-empty string. Provided value: %s',
+                           self.paw, executor_name)
+
+    def set_pending_executor_path_update(self, executor_name, new_binary_path):
+        """Mark specified executor to update its binary path to the new path.
+        :param executor_name: name of executor for agent to update binary path
+        :type executor_name: str
+        :param new_binary_path: new binary path for executor to reference
+        :type new_binary_path: str
+        """
+        if executor_name and new_binary_path and isinstance(executor_name, str) and isinstance(new_binary_path, str):
+            if executor_name in self.executors:
+                self._executor_change_to_assign = dict(action='update_path', executor=executor_name,
+                                                       value=new_binary_path)
+        else:
+            self.log.error('Paw %s: Invalid format for executor name or new binary path. '
+                           'Please provide non-empty strings. Provided values: %s, %s',
+                           self.paw, executor_name, new_binary_path)
+
+    def assign_pending_executor_change(self):
+        """Return the executor change dict and remove pending change to assign.
+        :return: Dict representing the executor change that is assigned.
+        :rtype: dict(str, str)
+        """
+        executor_change = self.executor_change_to_assign
+        self._executor_change_to_assign = None
+        return executor_change
 
     def _replace_payload_data(self, decoded_cmd, file_svc):
         for uuid in re.findall(self.RESERVED['payload'], decoded_cmd):
@@ -228,7 +364,7 @@ class Agent(FirstClassObjectInterface, BaseObject):
                 decoded_cmd = decoded_cmd.replace('#{payload:%s}' % uuid, display_name)
         return decoded_cmd
 
-    def _get_preferred_executor(self):
+    def _get_preferred_executor_name(self):
         if 'psh' in self.executors:
             return 'psh'
         elif 'sh' in self.executors:

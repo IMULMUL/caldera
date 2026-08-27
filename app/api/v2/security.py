@@ -8,7 +8,10 @@ from aiohttp import web
 def is_handler_authentication_exempt(handler):
     """Return True if the endpoint handler is authentication exempt."""
     try:
-        is_unauthenticated = handler.__caldera_unauthenticated__
+        if hasattr(handler, '__caldera_unauthenticated__'):
+            is_unauthenticated = handler.__caldera_unauthenticated__
+        else:
+            is_unauthenticated = handler.keywords.get('handler').__caldera_unauthenticated__
     except AttributeError:
         is_unauthenticated = False
     return is_unauthenticated
@@ -21,11 +24,17 @@ def _wrap_async_method(method: types.MethodType):
     return functools.wraps(method)(wrapper)
 
 
-def _wrap_method(method: types.MethodType):
+def _wrap_sync_method(method: types.MethodType):
     """Wrap the input bound method in an async function."""
     def wrapper(*args, **kwargs):
         return method(*args, **kwargs)
     return functools.wraps(method)(wrapper)
+
+
+def _wrap_method(method: types.MethodType):
+    if inspect.iscoroutinefunction(method):
+        return _wrap_async_method(method)
+    return _wrap_sync_method(method)
 
 
 def authentication_exempt(handler):
@@ -38,11 +47,7 @@ def authentication_exempt(handler):
     # Can't set attributes directly on a bound method so we need to
     # wrap it in a function that we can mark it as unauthenticated
     if inspect.ismethod(handler):
-        if inspect.iscoroutinefunction(handler):
-            handler = _wrap_async_method(handler)
-        else:
-            handler = _wrap_method(handler)
-
+        handler = _wrap_method(handler)
     handler.__caldera_unauthenticated__ = True
     return handler
 
@@ -62,3 +67,13 @@ def authentication_required_middleware_factory(auth_svc):
             raise web.HTTPUnauthorized()
         return await handler(request)
     return authentication_required_middleware
+
+
+@web.middleware
+async def pass_option_middleware(request, handler):
+    """Allow all 'OPTIONS' request to the server to return 200
+    This mitigates CORS issues while developing the UI.
+    """
+    if request.method == 'OPTIONS':
+        raise web.HTTPOk()
+    return await handler(request)

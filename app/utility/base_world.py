@@ -1,19 +1,20 @@
 import binascii
 import string
-import os
 import re
 import yaml
 import logging
 import subprocess
-import distutils.version
+import packaging.version
 from base64 import b64encode, b64decode
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module
 from random import randint, choice
 from enum import Enum
 
 import marshmallow as ma
 import marshmallow_enum as ma_enum
+
+from app.utility.config_util import hash_config_creds
 
 
 class BaseWorld:
@@ -24,9 +25,20 @@ class BaseWorld:
     _app_configuration = dict()
 
     re_base64 = re.compile('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', flags=re.DOTALL)
+    TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
     @staticmethod
-    def apply_config(name, config):
+    def apply_config(name, config, apply_hash=False, overwrite_path=''):
+        """
+        Hashes credentials and API keys if needed. Overwrites config at path with secure
+        version if any changes are made.
+        """
+        if apply_hash:
+            changes_made = hash_config_creds(config)
+            if changes_made and overwrite_path:
+                logging.debug(f'Overwriting config file {overwrite_path} with secure values')
+                with open(overwrite_path, 'w') as cfg_file:
+                    yaml.safe_dump(config, cfg_file, default_flow_style=False)
         BaseWorld._app_configuration[name] = config
 
     @staticmethod
@@ -58,7 +70,11 @@ class BaseWorld:
     @staticmethod
     def jitter(fraction):
         i = fraction.split('/')
-        return randint(int(i[0]), int(i[1]))
+        min, max = int(i[0]), int(i[1])
+        if min > max:
+            logging.warning(f'Jitter range max value (max={max}) less than min value (min={min}). Using min={max} and max={min}.')
+            min, max = max, min
+        return randint(min, max)
 
     @staticmethod
     def create_logger(name):
@@ -79,8 +95,12 @@ class BaseWorld:
             f.write(line.rstrip('\r\n') + '\n' + content)
 
     @staticmethod
-    def get_current_timestamp(date_format='%Y-%m-%d %H:%M:%S'):
-        return datetime.now().strftime(date_format)
+    def get_current_timestamp(date_format=TIME_FORMAT):
+        return datetime.now(timezone.utc).strftime(date_format)
+
+    @staticmethod
+    def get_timestamp_from_string(datetime_str, date_format=TIME_FORMAT):
+        return datetime.strptime(datetime_str, date_format)
 
     @staticmethod
     async def load_module(module_type, module_info):
@@ -110,15 +130,6 @@ class BaseWorld:
         return False
 
     @staticmethod
-    async def walk_file_path(path, target):
-        for root, _, files in os.walk(path):
-            if target in files:
-                return os.path.join(root, target)
-            if '%s.xored' % target in files:
-                return os.path.join(root, '%s.xored' % target)
-        return None
-
-    @staticmethod
     def check_requirement(params):
         def check_module_version(module, version, attr=None, **kwargs):
             attr = attr if attr else '__version__'
@@ -131,7 +142,7 @@ class BaseWorld:
 
         def compare_versions(version_string, minimum_version):
             version = parse_version(version_string)
-            return distutils.version.StrictVersion(version) >= distutils.version.StrictVersion(str(minimum_version))
+            return packaging.version.parse(version) >= packaging.version.parse(str(minimum_version))
 
         def parse_version(version_string, pattern=r'([0-9]+(?:\.[0-9]+)+)'):
             groups = re.search(pattern, version_string)

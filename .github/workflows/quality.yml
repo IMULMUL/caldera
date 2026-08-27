@@ -1,0 +1,118 @@
+name: Code Quality
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: 3.10.9
+            toxenv: py310,style,coverage-ci
+          - python-version: 3.11
+            toxenv: py311,style,coverage-ci
+          - python-version: 3.12
+            toxenv: py312,style,coverage-ci
+          - python-version: 3.13
+            toxenv: py313,style,coverage-ci
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade virtualenv
+          pip install tox
+          npm --prefix plugins/magma install
+          npm --prefix plugins/magma run build
+
+      - name: Run tests
+        env:
+          TOXENV: ${{ matrix.toxenv }}
+        run: tox
+
+      - name: SonarQube Scan
+        # Dependabot-authored PR runs receive no repository secrets, so SONAR_TOKEN is
+        # empty and the scan can only fail; skip it there. The merged result is still
+        # scanned by the push-event run on master.
+        if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]') }}
+        uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e  # v8.2.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # Fork PR analysis is handed off to the trusted .github/workflows/
+      # sonar-fork-pr.yml workflow via workflow_run, which executes against
+      # a TRUSTED base checkout and treats the artifacts uploaded below as
+      # untrusted data only. See SECURITY note in that workflow.
+      # ------------------------------------------------------------------
+      - name: Stage fork PR Sonar artifacts
+        if: ${{ matrix.python-version == '3.13' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        env:
+          # Fork-controlled fields. Pass through env vars and jq so they
+          # cannot inject into the shell or the resulting JSON. The trusted
+          # sonar-fork-pr.yml workflow re-validates everything before use.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+          HEAD_REF:  ${{ github.event.pull_request.head.ref }}
+          BASE_SHA:  ${{ github.event.pull_request.base.sha }}
+          BASE_REF:  ${{ github.event.pull_request.base.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p sonar-fork-pr-artifact
+          if [ -f coverage.xml ]; then
+            cp coverage.xml sonar-fork-pr-artifact/coverage.xml
+          fi
+          jq -n \
+            --arg pr_number "$PR_NUMBER" \
+            --arg head_sha  "$HEAD_SHA" \
+            --arg head_ref  "$HEAD_REF" \
+            --arg base_sha  "$BASE_SHA" \
+            --arg base_ref  "$BASE_REF" \
+            --arg head_repo "$HEAD_REPO" \
+            '{pr_number:$pr_number, head_sha:$head_sha, head_ref:$head_ref, base_sha:$base_sha, base_ref:$base_ref, head_repo:$head_repo}' \
+            > sonar-fork-pr-artifact/pr-meta.json
+          tar --exclude='./.git' \
+              --exclude='./node_modules' \
+              --exclude='./plugins/magma/node_modules' \
+              --exclude='./plugins/magma/dist' \
+              --exclude='./sonar-fork-pr-artifact' \
+              -czf sonar-fork-pr-artifact/pr-source.tar.gz ./app ./sonar-project.properties || true
+
+      - name: Upload fork PR Sonar artifacts
+        if: ${{ matrix.python-version == '3.13' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sonar-fork-pr
+          path: sonar-fork-pr-artifact/
+          retention-days: 3
+          if-no-files-found: warn

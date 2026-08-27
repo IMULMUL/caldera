@@ -1,7 +1,8 @@
 import asyncio
-import datetime
 import json
 import websockets
+
+from datetime import datetime, timezone
 
 from app.service.interfaces.i_event_svc import EventServiceInterface
 from app.utility.base_service import BaseService
@@ -72,7 +73,7 @@ class EventService(EventServiceInterface, BaseService):
         queue = queue or self.default_queue
         metadata = {}
         if timestamp:
-            metadata.update(dict(timestamp=datetime.datetime.now().timestamp()))
+            metadata.update(dict(timestamp=datetime.now(timezone.utc).timestamp()))
         callback_kwargs.update(dict(metadata=metadata))
         uri = '/'.join([self.ws_uri, exchange, queue])
         if self.global_listeners:
@@ -81,6 +82,7 @@ class EventService(EventServiceInterface, BaseService):
         d = json.dumps(callback_kwargs)
         async with websockets.connect(uri) as websocket:
             asyncio.get_event_loop().create_task(self.handle_exceptions(websocket.send(d)))
+            await asyncio.sleep(0)  # yield control to event loop
 
 
 class _Handle:

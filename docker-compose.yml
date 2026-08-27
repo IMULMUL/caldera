@@ -5,15 +5,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args: 
-        TZ: "UTC" #TZ sets timezone for ubuntu setup
-        WIN_BUILD: "false" #WIN_BUILD is used to enable windows build in sandcat plugin
+      args:
+        TZ: "UTC" # Timezone to use in container
+        VARIANT: "full"
     image: caldera:latest
+    container_name: caldera
     ports:
       - "8888:8888"
+      - "8443:8443"
       - "7010:7010"
       - "7011:7011/udp"
       - "7012:7012"
+      - "8853:8853"
+      - "8022:8022"
+      - "2222:2222"
     volumes:
       - ./:/usr/src/app
-    command: --fresh --insecure
+      - /usr/src/app/plugins/magma # Anonymous volume to preserve built UI assets from being overwritten by host mount
+    command: --log DEBUG

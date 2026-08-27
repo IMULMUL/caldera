@@ -5,8 +5,8 @@ from app.utility.base_planning_svc import BasePlanningService
 
 class PlanningService(PlanningServiceInterface, BasePlanningService):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, global_variable_owners=None):
+        super().__init__(global_variable_owners=global_variable_owners)
         self.log = self.add_service('planning_svc', self)
 
     async def exhaust_bucket(self, planner, bucket, operation, agent=None, batch=False, condition_stop=True):
@@ -41,8 +41,8 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
             links = await self.get_links(operation, [bucket], agent)
             if len(links) == 0:
                 break
-            for l in links:
-                l_id = await operation.apply(l)
+            for s_link in links:
+                l_id = await operation.apply(s_link)
                 if batch:
                     l_ids.append(l_id)
                 else:
@@ -118,7 +118,7 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
         :type planner: LogicalPlanner
         :param publish_transitions: flag to publish bucket transitions as
           events to the event service
-        :type publish tranitions: bool
+        :type publish_transitions: bool
         """
         async def _publish_bucket_transition(bucket):
             """ subroutine to publish bucket transitions to event_svc"""
@@ -175,7 +175,7 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
             agent_links = []
             for agent in operation.agents:
                 agent_links.append(await self.generate_and_trim_links(agent, operation, abilities, trim))
-            links = self._remove_links_of_duplicate_singletons(agent_links)
+            links = await self._remove_links_of_duplicate_singletons(agent_links)
         self.log.debug('Generated %s usable links' % (len(links)))
         return await self.sort_links(links)
 
@@ -245,8 +245,9 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
             if all stopping conditions have not been met
         :rtype: bool
         """
+        all_facts = await operation.all_facts()
         for sc in stopping_conditions:
-            if not await self._stopping_condition_met(operation.all_facts(), sc):
+            if not await self._stopping_condition_met(all_facts, sc):
                 return False
         return True
 
@@ -272,8 +273,6 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
         :rtype: list(Link)
         """
         return sorted(links, key=lambda k: (-k.score))
-
-    """ PRIVATE """
 
     async def _stop_bucket_exhaustion(self, planner, operation, condition_stop):
         """Determine whether to continue running the bucket.
@@ -348,14 +347,16 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
         :rtype: list(Link)
         """
         links = []
-        for a in await agent.capabilities(abilities):
-            if a.code and a.HOOKS:
-                await a.HOOKS[a.language](a)
-            if a.test:
-                links.append(
-                    Link.load(dict(command=a.test, paw=agent.paw, score=0, ability=a,
-                                   status=link_status, jitter=self.jitter(operation.jitter)))
-                )
+        for ability in await agent.capabilities(abilities):
+            executor = await agent.get_preferred_executor(ability)
+            if not executor:
+                continue
+            await self._call_ability_plugin_hooks(ability, executor)
+            if executor.command:
+                link = Link.load(dict(command=self.encode_string(executor.test), paw=agent.paw, score=0,
+                                      ability=ability, executor=executor, status=link_status,
+                                      jitter=self.jitter(operation.jitter)))
+                links.append(link)
         return links
 
     async def _generate_cleanup_links(self, operation, agent, link_status):
@@ -371,20 +372,30 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
         :rtype: list(Link)
         """
         links = []
-        for link in [l for l in operation.chain if l.paw == agent.paw]:
-            matched_abilities = await self.get_service('data_svc').locate('abilities',
-                                                                          match=dict(unique=link.ability.unique))
-            if matched_abilities:
-                ability = matched_abilities[0]
-                for cleanup in ability.cleanup:
-                    decoded_cmd = agent.replace(cleanup, file_svc=self.get_service('file_svc'))
-                    variant, _, _ = await self._build_single_test_variant(decoded_cmd, link.used, link.ability.executor)
-                    lnk = Link.load(dict(command=self.encode_string(variant), paw=agent.paw, cleanup=1,
-                                         ability=ability, score=0, jitter=2, status=link_status))
-                    if lnk.command not in [l.command for l in links]:
-                        lnk.apply_id(agent.host)
-                        links.append(lnk)
+        cleanup_commands = set()
+        for link in operation.chain:
+            if link.paw != agent.paw:
+                continue
+
+            for cleanup in link.executor.cleanup:
+                decoded_cmd = agent.replace(self.encode_string(cleanup), file_svc=self.get_service('file_svc'))
+                variant, _, _ = await self._build_single_test_variant(decoded_cmd, link.used, link.executor.name)
+                cleanup_command = self.encode_string(variant)
+                if cleanup_command and cleanup_command not in cleanup_commands:
+                    cleanup_commands.add(cleanup_command)
+                    lnk = Link.load(dict(command=cleanup_command, paw=agent.paw, cleanup=1,
+                                         ability=link.ability, executor=link.executor, score=0, jitter=2,
+                                         status=link_status))
+                    lnk.apply_id(agent.host)
+                    links.append(lnk)
         return links
+
+    async def _call_ability_plugin_hooks(self, ability, executor):
+        """Calls any plugin hooks (at runtime) that exist for the ability and executor."""
+        if (hasattr(executor, 'HOOKS') and executor.HOOKS and
+                hasattr(executor, 'language') and executor.language and
+                executor.language in executor.HOOKS):
+            await executor.HOOKS[executor.language](ability, executor)
 
     @staticmethod
     async def _apply_adjustments(operation, links):
@@ -395,8 +406,8 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
         :param links: Links to apply adjustments to
         :type links: list(Link)
         """
-        for l in links:
-            for adjustment in [a for a in operation.source.adjustments if a.ability_id == l.ability.ability_id]:
+        for a_link in links:
+            for adjustment in [a for a in operation.source.adjustments if a.ability_id == a_link.ability.ability_id]:
                 if operation.has_fact(trait=adjustment.trait, value=adjustment.value):
-                    l.visibility.apply(adjustment)
-                    l.status = l.states['HIGH_VIZ']
+                    a_link.visibility.apply(adjustment)
+                    a_link.status = a_link.states['HIGH_VIZ']

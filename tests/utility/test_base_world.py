@@ -1,7 +1,7 @@
 import pytest
 import yaml
 
-from datetime import datetime
+from datetime import datetime, timezone
 from app.utility.base_world import BaseWorld
 
 
@@ -82,7 +82,7 @@ class TestBaseWorld:
     def test_get_current_timestamp(self):
         date_format = '%Y-%m-%d %H'
         output = BaseWorld.get_current_timestamp(date_format)
-        cur_time = datetime.now().strftime(date_format)
+        cur_time = datetime.now(timezone.utc).strftime(date_format)
         assert cur_time == output
 
     def test_is_not_base64(self):
@@ -91,17 +91,3 @@ class TestBaseWorld:
     def test_is_base64(self):
         b64str = 'aGVsbG8gd29ybGQgZnJvbSB1bml0IHRlc3QgbGFuZAo='
         assert BaseWorld.is_base64(b64str)
-
-    def test_walk_file_path_exists_nonxor(self, loop, text_file):
-        ret = loop.run_until_complete(BaseWorld.walk_file_path(text_file.dirname, text_file.basename))
-        assert ret == text_file
-
-    def test_walk_file_path_notexists(self, loop, text_file):
-        ret = loop.run_until_complete(BaseWorld.walk_file_path(text_file.dirname, 'not-a-real.file'))
-        assert ret is None
-
-    def test_walk_file_path_xor_fn(self, loop, tmpdir):
-        f = tmpdir.mkdir('txt').join('xorfile.txt.xored')
-        f.write("test")
-        ret = loop.run_until_complete(BaseWorld.walk_file_path(f.dirname, 'xorfile.txt'))
-        assert ret == f
